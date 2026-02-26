@@ -1,3 +1,31 @@
+# GitHub Repo Manager - Change Log
+
+## v2.4.6 - 2026-02-26
+
+### Fixed
+- Corrected local project scanning to include hidden directories on Windows 10/11 by using `Get-ChildItem -Directory -Force`.
+- Fixed `.git` detection for both:
+  - standard hidden `.git` directories
+  - `.git` pointer files using `gitdir: ...` (worktree/submodule/separate git-dir layouts)
+- Fixed rename/identity detection to stop assuming project-local `.git\config` and instead resolve the actual Git metadata path first.
+- Fixed backup logic to archive the resolved Git directory target instead of only `<project>/.git`.
+
+### Behavior Updates
+- Added a centralized Git metadata resolver (`Resolve-GitMetadataPath`) used by:
+  - `Test-GitCorrupted`
+  - `Get-RemoteRepoName`
+  - `Backup-GitFolder`
+- `.git` pointer files with missing/invalid `gitdir` targets are now explicitly classified as corrupted and follow existing restore/repair flow.
+- Added explicit runtime logs for:
+  - detected `.git` directory
+  - detected `.git` pointer file + resolved target
+  - invalid `.git` pointer file target classification
+
+### Impact
+- Prevents false "no .git" results caused by hidden metadata on Windows.
+- Enables reliable handling of non-standard Git layouts without breaking existing M3/restore behavior.
+- Reduces incorrect skips during rename detection and improves backup correctness.
+
 Here’s a clear, structured **v2.4.1 change log** for your Repo Manager. It focuses on what changed, why it changed, and how it improves reliability, safety, and correctness.
 
 ---

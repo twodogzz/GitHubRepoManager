@@ -89,21 +89,83 @@ if (-not (Test-Path $BackupRoot)) {
     New-Item -ItemType Directory -Path $BackupRoot | Out-Null
 }
 
+function Resolve-GitMetadataPath {
+    param([string]$FolderPath)
+
+    $gitEntryPath = Join-Path $FolderPath ".git"
+    if (-not (Test-Path -LiteralPath $gitEntryPath)) { return $null }
+
+    $gitEntryItem = Get-Item -LiteralPath $gitEntryPath -Force -ErrorAction SilentlyContinue
+    if (-not $gitEntryItem) { return $null }
+
+    $isPointerFile = $false
+    $isValid       = $true
+    $gitDirPath    = $null
+
+    if ($gitEntryItem.PSIsContainer) {
+        $gitDirPath = $gitEntryItem.FullName
+    }
+    else {
+        $isPointerFile = $true
+        $gitdirLine = Get-Content -LiteralPath $gitEntryPath -ErrorAction SilentlyContinue |
+                      Where-Object { $_ -match '^\s*gitdir\s*:\s*(.+)\s*$' } |
+                      Select-Object -First 1
+
+        if (-not $gitdirLine) {
+            $isValid = $false
+        }
+        else {
+            $gitdirTarget = ([regex]::Match($gitdirLine, '^\s*gitdir\s*:\s*(.+)\s*$')).Groups[1].Value.Trim()
+            if ([System.IO.Path]::IsPathRooted($gitdirTarget)) {
+                $resolvedPath = $gitdirTarget
+            }
+            else {
+                $resolvedPath = Join-Path $FolderPath $gitdirTarget
+            }
+
+            try {
+                $gitDirPath = [System.IO.Path]::GetFullPath($resolvedPath)
+            }
+            catch {
+                $gitDirPath = $resolvedPath
+            }
+
+            if (-not (Test-Path -LiteralPath $gitDirPath -PathType Container)) {
+                $isValid = $false
+            }
+        }
+    }
+
+    $configPath = if ($gitDirPath) { Join-Path $gitDirPath "config" } else { $null }
+    $headPath   = if ($gitDirPath) { Join-Path $gitDirPath "HEAD" } else { $null }
+    $refsPath   = if ($gitDirPath) { Join-Path $gitDirPath "refs" } else { $null }
+
+    return [pscustomobject]@{
+        GitEntryPath   = $gitEntryPath
+        GitDirPath     = $gitDirPath
+        ConfigPath     = $configPath
+        HeadPath       = $headPath
+        RefsPath       = $refsPath
+        IsPointerFile  = $isPointerFile
+        IsValid        = $isValid
+    }
+}
+
 function Test-GitCorrupted {
     param([string]$FolderPath)
 
-    $gitPath = Join-Path $FolderPath ".git"
-    if (-not (Test-Path $gitPath)) { return $true }
+    $gitMetadata = Resolve-GitMetadataPath -FolderPath $FolderPath
+    if (-not $gitMetadata) { return $true }
+    if (-not $gitMetadata.IsValid) { return $true }
 
-    $config = Join-Path $gitPath "config"
-    $head   = Join-Path $gitPath "HEAD"
-    $refs   = Join-Path $gitPath "refs"
+    if (-not (Test-Path -LiteralPath $gitMetadata.ConfigPath)) { return $true }
+    if (-not (Test-Path -LiteralPath $gitMetadata.HeadPath))   { return $true }
 
-    if (-not (Test-Path $config)) { return $true }
-    if (-not (Test-Path $head))   { return $true }
-    if (-not (Test-Path $refs))   { return $true }
+    $packedRefs = Join-Path $gitMetadata.GitDirPath "packed-refs"
+    $hasRefs    = (Test-Path -LiteralPath $gitMetadata.RefsPath) -or (Test-Path -LiteralPath $packedRefs)
+    if (-not $hasRefs) { return $true }
 
-    $urlLine = Select-String -Path $config -Pattern "url =" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $urlLine = Select-String -Path $gitMetadata.ConfigPath -Pattern "url =" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $urlLine) { return $true }
 
     return $false
@@ -115,16 +177,17 @@ function Backup-GitFolder {
         [string]$ProjectName
     )
 
-    $gitPath = Join-Path $FolderPath ".git"
-    if (-not (Test-Path $gitPath)) { return }
+    $gitMetadata = Resolve-GitMetadataPath -FolderPath $FolderPath
+    if (-not $gitMetadata) { return }
+    if (-not $gitMetadata.IsValid) { return }
 
     $backupFile      = Join-Path $BackupRoot "$ProjectName.git.zip"
-    $gitLastWrite    = (Get-Item $gitPath).LastWriteTime
+    $gitLastWrite    = (Get-Item -LiteralPath $gitMetadata.GitDirPath -Force).LastWriteTime
     $backupLastWrite = if (Test-Path $backupFile) { (Get-Item $backupFile).LastWriteTime } else { [datetime]::MinValue }
 
     if ($gitLastWrite -gt $backupLastWrite) {
         if (Test-Path $backupFile) { Remove-Item $backupFile -Force }
-        Compress-Archive -Path $gitPath -DestinationPath $backupFile -Force
+        Compress-Archive -Path $gitMetadata.GitDirPath -DestinationPath $backupFile -Force
         Log "Backed up .git for '$ProjectName' to '$backupFile'"
     }
 }
@@ -150,11 +213,13 @@ function Restore-GitFolder {
 function Get-RemoteRepoName {
     param([string]$FolderPath)
 
-    $gitConfig = Join-Path $FolderPath ".git\config"
-    if (-not (Test-Path $gitConfig)) { return $null }
+    $gitMetadata = Resolve-GitMetadataPath -FolderPath $FolderPath
+    if (-not $gitMetadata) { return $null }
+    if (-not $gitMetadata.IsValid) { return $null }
+    if (-not (Test-Path -LiteralPath $gitMetadata.ConfigPath)) { return $null }
 
     try {
-        $urlLine = Select-String -Path $gitConfig -Pattern "url =" -ErrorAction SilentlyContinue | Select-Object -First 1
+        $urlLine = Select-String -Path $gitMetadata.ConfigPath -Pattern "url =" -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $urlLine) { return $null }
 
         $url = $urlLine.ToString().Split("=")[1].Trim()
@@ -205,7 +270,7 @@ catch {
 }
 
 # ---------- LOCAL PROJECTS (FIRST PASS) ----------
-$LocalProjects = Get-ChildItem -Path $BasePath -Directory |
+$LocalProjects = Get-ChildItem -Path $BasePath -Directory -Force |
                  Where-Object { $_.Name -ne ".git_backups" } |
                  Select-Object -ExpandProperty Name
 
@@ -218,13 +283,26 @@ foreach ($Project in $LocalProjects) {
     $ProjectPath = Join-Path $BasePath $Project
     if (-not (Test-Path $ProjectPath)) { continue }
 
-    $gitPath = Join-Path $ProjectPath ".git"
+    $gitMetadata = Resolve-GitMetadataPath -FolderPath $ProjectPath
+    $gitPath     = Join-Path $ProjectPath ".git"
 
-    if (-not (Test-Path $gitPath)) {
+    if (-not $gitMetadata) {
         # N3-style detailed log
         LogN3 "INFO" $Project $gitPath
         # Do not run backup/restore; project remains in pipeline for later steps
         continue
+    }
+
+    if ($gitMetadata.IsPointerFile) {
+        if ($gitMetadata.IsValid) {
+            Log "Detected .git pointer file for '$Project' -> '$($gitMetadata.GitDirPath)'."
+        }
+        else {
+            Log "Detected invalid .git pointer file for '$Project'. Target path missing/unreadable. Classified as corrupted."
+        }
+    }
+    else {
+        Log "Detected .git directory for '$Project' at '$($gitMetadata.GitDirPath)'."
     }
 
     # .git exists — safe to run health/backup
@@ -270,10 +348,6 @@ foreach ($Project in $LocalProjects) {
 
     $ProjectPath = Join-Path $BasePath $Project
     if (-not (Test-Path $ProjectPath)) { continue }
-
-    # Rename detection requires .git/config
-    $gitConfig = Join-Path $ProjectPath ".git\config"
-    if (-not (Test-Path $gitConfig)) { continue }
 
     if (Test-GitCorrupted $ProjectPath) { continue }
 
@@ -340,7 +414,7 @@ foreach ($Project in $LocalProjects) {
 }
 
 # ---------- REBUILD LOCAL PROJECTS AFTER POSSIBLE RENAMES ----------
-$LocalProjects = Get-ChildItem -Path $BasePath -Directory |
+$LocalProjects = Get-ChildItem -Path $BasePath -Directory -Force |
                  Where-Object { $_.Name -ne ".git_backups" } |
                  Select-Object -ExpandProperty Name
 
