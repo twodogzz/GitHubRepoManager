@@ -1,5 +1,5 @@
 ﻿# ============================================
-# Local Folders ↔ GitHub Repo Manager (v2.3 Hardened + .git Backup)
+# Local Folders ↔ GitHub Repo Manager (v2.4 Intelligent)
 # Author: Wayne Freestun + Kai
 # ============================================
 
@@ -83,8 +83,8 @@ function Backup-GitFolder {
     $gitPath = Join-Path $FolderPath ".git"
     if (-not (Test-Path $gitPath)) { return }
 
-    $backupFile    = Join-Path $BackupRoot "$ProjectName.git.zip"
-    $gitLastWrite  = (Get-Item $gitPath).LastWriteTime
+    $backupFile      = Join-Path $BackupRoot "$ProjectName.git.zip"
+    $gitLastWrite    = (Get-Item $gitPath).LastWriteTime
     $backupLastWrite = if (Test-Path $backupFile) { (Get-Item $backupFile).LastWriteTime } else { [datetime]::MinValue }
 
     if ($gitLastWrite -gt $backupLastWrite) {
@@ -110,6 +110,25 @@ function Restore-GitFolder {
     Expand-Archive -Path $backupFile -DestinationPath $FolderPath -Force
     Log "Restored .git for '$ProjectName' from backup."
     return $true
+}
+
+function Get-RemoteRepoName {
+    param([string]$FolderPath)
+
+    $gitConfig = Join-Path $FolderPath ".git\config"
+    if (-not (Test-Path $gitConfig)) { return $null }
+
+    try {
+        $urlLine = Select-String -Path $gitConfig -Pattern "url =" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $urlLine) { return $null }
+
+        $url = $urlLine.ToString().Split("=")[1].Trim()
+        $repoName = ($url -split "/")[-1].Replace(".git","")
+        return $repoName
+    }
+    catch {
+        return $null
+    }
 }
 
 # ---------- GITHUB API ----------
@@ -199,7 +218,101 @@ $RemoteProjects = $Repos |
 
 Log "Remote repos: $($RemoteProjects -join ', ')"
 
-# ---------- SET COMPARISON ----------
+# ---------- INTELLIGENT RENAME DETECTION ----------
+foreach ($Project in $LocalProjects.ToArray()) {
+
+    $ProjectPath = Join-Path $BasePath $Project
+    if (-not (Test-Path $ProjectPath)) { continue }
+    if (Test-GitCorrupted $ProjectPath) { continue }
+
+    $RemoteName = Get-RemoteRepoName -FolderPath $ProjectPath
+    if (-not $RemoteName) { continue }
+
+    $HasRemoteRepo = $RemoteProjects -contains $RemoteName
+
+    # Only care when names differ and remote exists
+    if ($HasRemoteRepo -and $RemoteName -ne $Project) {
+
+        Write-Host "`n⚠️ Name mismatch detected." -ForegroundColor Yellow
+        Write-Host "Local folder: $Project"
+        Write-Host "GitHub repo: $RemoteName`n"
+        Write-Host "Renaming a GitHub repo updates URLs and may affect external links."
+        Write-Host "Renaming a local folder may affect scripts, shortcuts, or tooling.`n"
+
+        Write-Host "Choose an action:" -ForegroundColor Cyan
+        Write-Host "  1 = Rename GitHub repo → $Project"
+        Write-Host "  2 = Rename local folder → $RemoteName"
+        Write-Host "  3 = Skip (no action)"
+
+        $choice = Read-Host "Enter 1 / 2 / 3 (default = 3)"
+
+        switch ($choice) {
+
+            "1" {
+                # Rename GitHub repo to match local folder
+                if ($DryRun) {
+                    Log "DRY RUN: Would rename GitHub repo '$RemoteName' to '$Project'"
+                }
+                else {
+                    $Uri = "https://api.github.com/repos/$GitHubUser/$RemoteName"
+                    Invoke-GitHubApi PATCH $Uri @{ name = $Project }
+                    Log "Renamed GitHub repo '$RemoteName' to '$Project'"
+
+                    # Update in-memory remote list
+                    $RemoteProjects = $RemoteProjects | ForEach-Object {
+                        if ($_ -eq $RemoteName) { $Project } else { $_ }
+                    }
+                }
+            }
+
+            "2" {
+                # Rename local folder to match GitHub repo
+                $NewPath = Join-Path $BasePath $RemoteName
+                if ($DryRun) {
+                    Log "DRY RUN: Would rename local folder '$Project' to '$RemoteName'"
+                }
+                else {
+                    if (-not (Test-Path $NewPath)) {
+                        Rename-Item -Path $ProjectPath -NewName $RemoteName
+                        Log "Renamed local folder '$Project' to '$RemoteName'"
+
+                        # Update in-memory local list
+                        $LocalProjects = $LocalProjects | ForEach-Object {
+                            if ($_ -eq $Project) { $RemoteName } else { $_ }
+                        }
+                    }
+                    else {
+                        Log "Cannot rename folder '$Project' to '$RemoteName' because '$NewPath' already exists."
+                    }
+                }
+            }
+
+            default {
+                Log "Skipped rename for mismatch: folder '$Project', repo '$RemoteName'"
+            }
+        }
+    }
+}
+
+# ---------- REBUILD SETS AFTER POSSIBLE RENAMES ----------
+$LocalProjects = Get-ChildItem -Path $BasePath -Directory |
+                 Where-Object { $Excluded -notcontains $_.Name } |
+                 Select-Object -ExpandProperty Name
+
+$Repos = @()
+$page = 1
+do {
+    $Uri   = "https://api.github.com/user/repos?per_page=100&page=$page"
+    $batch = Invoke-GitHubApi GET $Uri
+    if (!$batch) { break }
+    $Repos += $batch
+    $page++
+} while ($batch.Count -gt 0)
+
+$RemoteProjects = $Repos |
+                  Where-Object { $_.owner.login -eq $GitHubUser } |
+                  Select-Object -ExpandProperty name
+
 $LocalSet  = [System.Collections.Generic.HashSet[string]]::new()
 $RemoteSet = [System.Collections.Generic.HashSet[string]]::new()
 
@@ -232,26 +345,6 @@ $OrphanRemote  = $RemoteProjects | Where-Object { -not $LocalSet.Contains($_) }
 
 Log "Local without repo: $($MissingRemote -join ', ')"
 Log "Repos without folder: $($OrphanRemote -join ', ')"
-
-# ---------- RENAME DETECTION (SIMPLE 1↔1) ----------
-if ($MissingRemote.Count -eq 1 -and $OrphanRemote.Count -eq 1) {
-    $NewName = $MissingRemote[0]
-    $OldName = $OrphanRemote[0]
-
-    Log "POSSIBLE RENAME: '$OldName' → '$NewName'"
-
-    $answer = Read-Host "Rename GitHub repo '$OldName' to '$NewName'? (Y/N)"
-    if ($answer -match '^[Yy]') {
-        if ($DryRun) {
-            Log "DRY RUN: Would rename repo '$OldName' to '$NewName'"
-        }
-        else {
-            $Uri  = "https://api.github.com/repos/$GitHubUser/$OldName"
-            Invoke-GitHubApi PATCH $Uri @{ name = $NewName }
-            Log "Repo renamed to $NewName"
-        }
-    }
-}
 
 # ---------- CREATE MISSING REPOS ----------
 foreach ($Project in $MissingRemote) {
@@ -291,7 +384,6 @@ foreach ($Project in $MissingRemote) {
 
     Log "Repo '$Project' created and pushed"
 
-    # Backup fresh .git after successful creation
     if (-not (Test-GitCorrupted $ProjectPath)) {
         Backup-GitFolder -FolderPath $ProjectPath -ProjectName $Project
     }
@@ -321,7 +413,6 @@ foreach ($RepoName in $OrphanRemote) {
                 Log "Cloning $RepoName to $LocalPath"
                 git clone $CloneUrl $LocalPath
 
-                # Backup .git for freshly cloned repo
                 if (-not (Test-GitCorrupted $LocalPath)) {
                     Backup-GitFolder -FolderPath $LocalPath -ProjectName $RepoName
                 }
