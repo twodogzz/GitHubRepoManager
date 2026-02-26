@@ -26,8 +26,6 @@
 - Enables reliable handling of non-standard Git layouts without breaking existing M3/restore behavior.
 - Reduces incorrect skips during rename detection and improves backup correctness.
 
-Here’s a clear, structured **v2.4.1 change log** for your Repo Manager. It focuses on what changed, why it changed, and how it improves reliability, safety, and correctness.
-
 ---
 
 ## **GitHub Repo Manager — v2.4.1 Change Log**
