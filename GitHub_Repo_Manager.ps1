@@ -1,18 +1,54 @@
 ﻿# ============================================
-# Local Folders ↔ GitHub Repo Manager (v2.4 Intelligent)
+# Local Folders ↔ GitHub Repo Manager (v2.4.5)
 # Author: Wayne Freestun + Kai
+# Features: Portable BasePath, N3 logging, treat missing .git as new project,
+#           always exclude .git_backups, prompt before create, M3 mismatch flow,
+#           DRY RUN in-memory simulation for renames.
 # ============================================
 
 # ---------- USER SETTINGS ----------
 $GitHubUser = "twodogzz"
 $Token      = $env:GITHUB_PAT
-$BasePath   = "E:\SoftwareProjects"
-$LogFile    = "$BasePath\GitHubRepoManager.log"
+
+# ---------- BASE PATH RESOLUTION ----------
+$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ConfigFile = Join-Path $ScriptRoot "GitHubRepoManager.config.json"
+$BasePath   = $null
+
+if (Test-Path $ConfigFile) {
+    try {
+        $Config   = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+        $BasePath = $Config.BasePath
+    }
+    catch {
+        Write-Host "Config file invalid or unreadable. Rebuilding..." -ForegroundColor Yellow
+        $BasePath = $null
+    }
+}
+
+if (-not $BasePath) {
+    $BasePath = Split-Path $ScriptRoot -Parent
+}
+
+if (-not (Test-Path $BasePath)) {
+    Write-Host "Project root not found at '$BasePath'." -ForegroundColor Yellow
+    $BasePath = Read-Host "Enter your SoftwareProjects folder path (e.g. C:\SoftwareProjects)"
+}
+
+if (-not (Test-Path $BasePath)) {
+    Write-Host "The path '$BasePath' does not exist. Aborting." -ForegroundColor Red
+    exit
+}
+
+# Save config for next run
+$Config = @{ BasePath = $BasePath }
+$Config | ConvertTo-Json | Set-Content $ConfigFile
+
+$LogFile    = Join-Path $BasePath "GitHubRepoManager.log"
 $BackupRoot = Join-Path $BasePath ".git_backups"
 
 # ---------- DRY RUN PROMPT ----------
 $answer = Read-Host "Run in DRY RUN mode (no GitHub changes)? (Y/N)"
-
 if ($answer -match '^[Yy]') {
     $DryRun = $true
     Write-Host "DRY RUN ENABLED - No GitHub changes will be made." -ForegroundColor Yellow
@@ -26,7 +62,6 @@ else {
 if (-not $DryRun) {
     Write-Host "`nWARNING: You are about to MODIFY GitHub repositories." -ForegroundColor Red
     Write-Host "This may CREATE, RENAME, or ARCHIVE repositories." -ForegroundColor Red
-
     $confirm = Read-Host "Type YES to confirm LIVE GitHub changes"
     if ($confirm -ne "YES") {
         Write-Host "Aborted. No changes made." -ForegroundColor Yellow
@@ -34,18 +69,18 @@ if (-not $DryRun) {
     }
 }
 
-# ---------- EXCLUSIONS ----------
-$Excluded = @(
-    "FileList.txt",
-    "MasterProjectList.rtf",
-    "SoftwareDevelopmentPlan.rtf"
-)
-
 # ---------- LOGGING ----------
 function Log($msg) {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "$timestamp | $msg"
     Write-Host $msg
+    Add-Content -Path $LogFile -Value $line
+}
+
+function LogN3($level, $project, $gitPath) {
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$timestamp] ${level}: $project has no .git folder (PATH: $gitPath). Marked as new project."
+    Write-Host $line
     Add-Content -Path $LogFile -Value $line
 }
 
@@ -169,10 +204,12 @@ catch {
     throw "Authentication failed. Check token scopes and expiry."
 }
 
-# ---------- LOCAL PROJECTS ----------
+# ---------- LOCAL PROJECTS (FIRST PASS) ----------
 $LocalProjects = Get-ChildItem -Path $BasePath -Directory |
-                 Where-Object { $Excluded -notcontains $_.Name } |
+                 Where-Object { $_.Name -ne ".git_backups" } |
                  Select-Object -ExpandProperty Name
+
+$LocalProjects = @($LocalProjects)
 
 Log "Local folders: $($LocalProjects -join ', ')"
 
@@ -181,6 +218,16 @@ foreach ($Project in $LocalProjects) {
     $ProjectPath = Join-Path $BasePath $Project
     if (-not (Test-Path $ProjectPath)) { continue }
 
+    $gitPath = Join-Path $ProjectPath ".git"
+
+    if (-not (Test-Path $gitPath)) {
+        # N3-style detailed log
+        LogN3 "INFO" $Project $gitPath
+        # Do not run backup/restore; project remains in pipeline for later steps
+        continue
+    }
+
+    # .git exists — safe to run health/backup
     if (Test-GitCorrupted $ProjectPath) {
         Log "Detected missing/corrupted .git in '$Project'."
         if (Restore-GitFolder -FolderPath $ProjectPath -ProjectName $Project) {
@@ -201,7 +248,7 @@ foreach ($Project in $LocalProjects) {
     }
 }
 
-# ---------- GET REMOTE REPOS ----------
+# ---------- GET REMOTE REPOS (FIRST PASS) ----------
 $Repos = @()
 $page = 1
 do {
@@ -219,10 +266,15 @@ $RemoteProjects = $Repos |
 Log "Remote repos: $($RemoteProjects -join ', ')"
 
 # ---------- INTELLIGENT RENAME DETECTION ----------
-foreach ($Project in $LocalProjects.ToArray()) {
+foreach ($Project in $LocalProjects) {
 
     $ProjectPath = Join-Path $BasePath $Project
     if (-not (Test-Path $ProjectPath)) { continue }
+
+    # Rename detection requires .git/config
+    $gitConfig = Join-Path $ProjectPath ".git\config"
+    if (-not (Test-Path $gitConfig)) { continue }
+
     if (Test-GitCorrupted $ProjectPath) { continue }
 
     $RemoteName = Get-RemoteRepoName -FolderPath $ProjectPath
@@ -230,7 +282,6 @@ foreach ($Project in $LocalProjects.ToArray()) {
 
     $HasRemoteRepo = $RemoteProjects -contains $RemoteName
 
-    # Only care when names differ and remote exists
     if ($HasRemoteRepo -and $RemoteName -ne $Project) {
 
         Write-Host "`n⚠️ Name mismatch detected." -ForegroundColor Yellow
@@ -249,37 +300,31 @@ foreach ($Project in $LocalProjects.ToArray()) {
         switch ($choice) {
 
             "1" {
-                # Rename GitHub repo to match local folder
                 if ($DryRun) {
                     Log "DRY RUN: Would rename GitHub repo '$RemoteName' to '$Project'"
+                    Log "DRY RUN: Simulated remote rename applied to internal state"
+                    $RemoteProjects = $RemoteProjects | ForEach-Object { if ($_ -eq $RemoteName) { $Project } else { $_ } }
                 }
                 else {
                     $Uri = "https://api.github.com/repos/$GitHubUser/$RemoteName"
                     Invoke-GitHubApi PATCH $Uri @{ name = $Project }
                     Log "Renamed GitHub repo '$RemoteName' to '$Project'"
-
-                    # Update in-memory remote list
-                    $RemoteProjects = $RemoteProjects | ForEach-Object {
-                        if ($_ -eq $RemoteName) { $Project } else { $_ }
-                    }
+                    $RemoteProjects = $RemoteProjects | ForEach-Object { if ($_ -eq $RemoteName) { $Project } else { $_ } }
                 }
             }
 
             "2" {
-                # Rename local folder to match GitHub repo
                 $NewPath = Join-Path $BasePath $RemoteName
                 if ($DryRun) {
                     Log "DRY RUN: Would rename local folder '$Project' to '$RemoteName'"
+                    Log "DRY RUN: Simulated local folder rename applied to internal state"
+                    $LocalProjects = $LocalProjects | ForEach-Object { if ($_ -eq $Project) { $RemoteName } else { $_ } }
                 }
                 else {
                     if (-not (Test-Path $NewPath)) {
                         Rename-Item -Path $ProjectPath -NewName $RemoteName
                         Log "Renamed local folder '$Project' to '$RemoteName'"
-
-                        # Update in-memory local list
-                        $LocalProjects = $LocalProjects | ForEach-Object {
-                            if ($_ -eq $Project) { $RemoteName } else { $_ }
-                        }
+                        $LocalProjects = $LocalProjects | ForEach-Object { if ($_ -eq $Project) { $RemoteName } else { $_ } }
                     }
                     else {
                         Log "Cannot rename folder '$Project' to '$RemoteName' because '$NewPath' already exists."
@@ -294,46 +339,98 @@ foreach ($Project in $LocalProjects.ToArray()) {
     }
 }
 
-# ---------- REBUILD SETS AFTER POSSIBLE RENAMES ----------
+# ---------- REBUILD LOCAL PROJECTS AFTER POSSIBLE RENAMES ----------
 $LocalProjects = Get-ChildItem -Path $BasePath -Directory |
-                 Where-Object { $Excluded -notcontains $_.Name } |
+                 Where-Object { $_.Name -ne ".git_backups" } |
                  Select-Object -ExpandProperty Name
 
-$Repos = @()
-$page = 1
-do {
-    $Uri   = "https://api.github.com/user/repos?per_page=100&page=$page"
-    $batch = Invoke-GitHubApi GET $Uri
-    if (!$batch) { break }
-    $Repos += $batch
-    $page++
-} while ($batch.Count -gt 0)
+$LocalProjects = @($LocalProjects)
 
-$RemoteProjects = $Repos |
-                  Where-Object { $_.owner.login -eq $GitHubUser } |
-                  Select-Object -ExpandProperty name
+# ---------- REFETCH REMOTE REPOS ONLY IN LIVE MODE ----------
+if (-not $DryRun) {
+    $Repos = @()
+    $page = 1
+    do {
+        $Uri   = "https://api.github.com/user/repos?per_page=100&page=$page"
+        $batch = Invoke-GitHubApi GET $Uri
+        if (!$batch) { break }
+        $Repos += $batch
+        $page++
+    } while ($batch.Count -gt 0)
 
+    $RemoteProjects = $Repos |
+                      Where-Object { $_.owner.login -eq $GitHubUser } |
+                      Select-Object -ExpandProperty name
+}
+
+# ---------- BUILD SETS ----------
 $LocalSet  = [System.Collections.Generic.HashSet[string]]::new()
 $RemoteSet = [System.Collections.Generic.HashSet[string]]::new()
 
 $LocalProjects  | ForEach-Object { [void]$LocalSet.Add($_) }
 $RemoteProjects | ForEach-Object { [void]$RemoteSet.Add($_) }
 
-# ---------- AUTO-UNARCHIVE DETECTION ----------
-foreach ($repo in $Repos) {
-    if ($repo.archived -and $LocalSet.Contains($repo.name)) {
+# ---------- CASE: local has no .git but remote exists (M3) ----------
+foreach ($Project in $LocalProjects) {
+    $ProjectPath = Join-Path $BasePath $Project
+    $gitPath = Join-Path $ProjectPath ".git"
 
-        Write-Host "`nRepo '$($repo.name)' is archived but a local folder exists." -ForegroundColor Magenta
-        $answer = Read-Host "Unarchive GitHub repo '$($repo.name)'? (Y/N)"
+    if ((-not (Test-Path $gitPath)) -and ($RemoteProjects -contains $Project)) {
 
-        if ($answer -match '^[Yy]') {
-            if ($DryRun) {
-                Log "DRY RUN: Would unarchive $($repo.name)"
+        # If a backup exists, offer restore first
+        $backupFile = Join-Path $BackupRoot "$Project.git.zip"
+        if (Test-Path $backupFile) {
+            Log "Backup exists for '$Project' at '$backupFile'. Offering restore."
+            $resp = Read-Host "A .git backup exists for '$Project'. Restore .git from backup? (Y/N)"
+            if ($resp -match '^[Yy]') {
+                if (Restore-GitFolder -FolderPath $ProjectPath -ProjectName $Project) {
+                    Log "Restored .git for '$Project' from backup."
+                    continue
+                }
             }
-            else {
-                $Uri = "https://api.github.com/repos/$GitHubUser/$($repo.name)"
-                Invoke-GitHubApi -Method PATCH -Uri $Uri -Body @{ archived = $false }
-                Log "Repo '$($repo.name)' unarchived."
+        }
+
+        Write-Host "`nA GitHub repo exists for '$Project' but the local folder has no .git." -ForegroundColor Yellow
+        Write-Host "Choose an action:" -ForegroundColor Cyan
+        Write-Host "  1 = Clone remote repo into this folder (restore .git)"
+        Write-Host "  2 = Recreate .git and connect to remote (git init + remote)"
+        Write-Host "  3 = Skip (do nothing)"
+
+        $mchoice = Read-Host "Enter 1 / 2 / 3 (default = 3)"
+
+        switch ($mchoice) {
+            "1" {
+                if ($DryRun) {
+                    Log "DRY RUN: Would clone https://github.com/$GitHubUser/$Project.git into $ProjectPath"
+                } else {
+                    # Initialize .git and attach remote, fetch and checkout main if present
+                    if (-not (Test-Path $ProjectPath)) { New-Item -ItemType Directory -Path $ProjectPath | Out-Null }
+                    Set-Location $ProjectPath
+                    if (-not (Test-Path ".git")) { git init | Out-Null }
+                    if (-not (git remote | Select-String origin)) {
+                        git remote add origin "https://github.com/$GitHubUser/$Project.git"
+                    }
+                    git fetch origin
+                    try { git checkout -b main origin/main } catch { }
+                    Log "Cloned remote into existing folder for '$Project' (restored .git)."
+                }
+            }
+            "2" {
+                if ($DryRun) {
+                    Log "DRY RUN: Would recreate .git and connect to https://github.com/$GitHubUser/$Project.git for $Project"
+                } else {
+                    Set-Location $ProjectPath
+                    if (-not (Test-Path ".git")) { git init | Out-Null }
+                    if (-not (git remote | Select-String origin)) {
+                        git remote add origin "https://github.com/$GitHubUser/$Project.git"
+                    }
+                    git fetch origin
+                    try { git checkout -b main origin/main } catch { }
+                    Log "Recreated .git and connected to remote for '$Project'."
+                }
+            }
+            default {
+                Log "User skipped auto-repair for '$Project'."
             }
         }
     }
@@ -346,14 +443,20 @@ $OrphanRemote  = $RemoteProjects | Where-Object { -not $LocalSet.Contains($_) }
 Log "Local without repo: $($MissingRemote -join ', ')"
 Log "Repos without folder: $($OrphanRemote -join ', ')"
 
-# ---------- CREATE MISSING REPOS ----------
+# ---------- CREATE MISSING REPOS (ask user per R1) ----------
 foreach ($Project in $MissingRemote) {
     $ProjectPath = Join-Path $BasePath $Project
     if (!(Test-Path $ProjectPath)) { continue }
 
+    Write-Host "`nLocal project '$Project' has no GitHub repo." -ForegroundColor Cyan
+    $create = Read-Host "Create GitHub repo for '$Project'? (Y/N)"
+    if ($create -notmatch '^[Yy]') {
+        Log "User chose not to create repo for '$Project'."
+        continue
+    }
+
     Log "Creating repo for $Project"
 
-    # Ensure base files
     foreach ($file in @("README.md","LICENSE",".gitignore")) {
         $path = Join-Path $ProjectPath $file
         if (!(Test-Path $path)) {
@@ -389,7 +492,7 @@ foreach ($Project in $MissingRemote) {
     }
 }
 
-# ---------- ORPHAN REMOTE REPOS (NO LOCAL FOLDER) ----------
+# ---------- ORPHAN REMOTE REPOS ----------
 foreach ($RepoName in $OrphanRemote) {
 
     $LocalPath = Join-Path $BasePath $RepoName
@@ -438,7 +541,7 @@ foreach ($RepoName in $OrphanRemote) {
 
 Log "SYNC COMPLETE"
 
-# ---------- SAFE PAUSE (SKIPS IN ISE) ----------
+# ---------- SAFE PAUSE ----------
 if ($Host.Name -notmatch "ISE") {
     Write-Host "`nPress any key to exit..." -ForegroundColor Yellow
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
