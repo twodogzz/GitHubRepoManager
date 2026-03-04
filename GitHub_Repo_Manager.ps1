@@ -270,8 +270,10 @@ catch {
 }
 
 # ---------- LOCAL PROJECTS (FIRST PASS) ----------
+# Exclude system/automation folders; they are workspace infrastructure, not GitHub project repos.
+$ExcludedFolders = @(".git_backups", "_logs", "_ecosystem")
 $LocalProjects = Get-ChildItem -Path $BasePath -Directory -Force |
-                 Where-Object { $_.Name -ne ".git_backups" } |
+                 Where-Object { $ExcludedFolders -notcontains $_.Name } |
                  Select-Object -ExpandProperty Name
 
 $LocalProjects = @($LocalProjects)
@@ -415,7 +417,7 @@ foreach ($Project in $LocalProjects) {
 
 # ---------- REBUILD LOCAL PROJECTS AFTER POSSIBLE RENAMES ----------
 $LocalProjects = Get-ChildItem -Path $BasePath -Directory -Force |
-                 Where-Object { $_.Name -ne ".git_backups" } |
+                 Where-Object { $ExcludedFolders -notcontains $_.Name } |
                  Select-Object -ExpandProperty Name
 
 $LocalProjects = @($LocalProjects)
